@@ -18,6 +18,10 @@
 #   SKIP_SSH_KEY=1         Skip copying the SSH private key
 #   SSH_KEY_NAME           Key filename (default id_ed25519)
 #   SSH_KEY_SRC_DIR        Source dir for the key (default /mnt/shared/Terminal)
+#   SKIP_WIREGUARD=1       Skip the WireGuard setup stage
+#   WG_SRC_DIR             Source dir for wg keys + conf (default /mnt/shared/Terminal)
+#   WG_DIR                 WireGuard config dir (default /etc/wireguard)
+#   WG_IFACE               WireGuard interface name (default wg0)
 #
 # Designed to be extended: add new install_* functions and register them
 # in the run_stages() list near the bottom.
@@ -36,6 +40,12 @@ OPENCODE_INSTALL_URL="https://opencode.ai/install"
 SKIP_SSH_KEY="${SKIP_SSH_KEY:-0}"
 SSH_KEY_NAME="${SSH_KEY_NAME:-id_ed25519}"
 SSH_KEY_SRC_DIR="${SSH_KEY_SRC_DIR:-/mnt/shared/Terminal}"
+
+# WireGuard setup
+SKIP_WIREGUARD="${SKIP_WIREGUARD:-0}"
+WG_SRC_DIR="${WG_SRC_DIR:-/mnt/shared/Terminal}"   # source for wg keys + conf
+WG_DIR="${WG_DIR:-/etc/wireguard}"
+WG_IFACE="${WG_IFACE:-wg0}"
 
 # If stdin is not a TTY (e.g. piped from curl), force non-interactive mode.
 if [ ! -t 0 ]; then
@@ -232,6 +242,87 @@ setup_ssh_key() {
 }
 
 # ---------------------------------------------------------------------------
+# Stage: WireGuard tunnel setup
+#
+# Copies wg-privatekey, wg-publickey, and wg0.conf from the shared folder into
+# /etc/wireguard, sets permissions, and brings up the tunnel. The copied
+# wg0.conf is the single source of truth for relay/peer details, so no
+# infrastructure values are baked into this script.
+# ---------------------------------------------------------------------------
+setup_wireguard() {
+  if [ "$SKIP_WIREGUARD" -eq 1 ]; then
+    warn "Skipping WireGuard setup (SKIP_WIREGUARD=1)."
+    return 0
+  fi
+
+  local src_dir="${WG_SRC_DIR%/}"
+  local src_priv="${src_dir}/wg-privatekey"
+  local src_pub="${src_dir}/wg-publickey"
+  local src_conf="${src_dir}/wg0.conf"
+  local conf_dest="${WG_DIR}/${WG_IFACE}.conf"
+
+  # The config file is mandatory; keys are expected alongside it.
+  if [ ! -f "$src_conf" ]; then
+    warn "No wg0.conf found at ${src_conf}; skipping WireGuard setup."
+    return 0
+  fi
+
+  # WireGuard install + service control needs root.
+  resolve_sudo
+
+  if ! have wg; then
+    if have apt-get; then
+      log "Installing wireguard..."
+      as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y wireguard
+    else
+      warn "'wg' not found and apt-get unavailable; cannot install WireGuard. Skipping."
+      return 0
+    fi
+  fi
+
+  log "Installing WireGuard config and keys into ${WG_DIR} ..."
+  as_root install -d -m 700 "$WG_DIR"
+
+  # Back up an existing conf before overwriting.
+  if as_root test -f "$conf_dest"; then
+    as_root cp -a "$conf_dest" "${conf_dest}.bak.$(date +%s)"
+    log "Backed up existing ${conf_dest}"
+  fi
+
+  # Copy the config (source of truth for the tunnel).
+  as_root cp -f "$src_conf" "$conf_dest"
+  as_root chmod 600 "$conf_dest"
+
+  # Copy keys if present (config may embed the key inline, so these are optional).
+  if [ -f "$src_priv" ]; then
+    as_root cp -f "$src_priv" "${WG_DIR}/privatekey"
+    as_root chmod 600 "${WG_DIR}/privatekey"
+    ok "Private key installed (chmod 600)."
+  else
+    warn "No wg-privatekey at ${src_priv}; relying on key embedded in wg0.conf."
+  fi
+  if [ -f "$src_pub" ]; then
+    as_root cp -f "$src_pub" "${WG_DIR}/publickey"
+    as_root chmod 644 "${WG_DIR}/publickey"
+    ok "Public key installed (chmod 644)."
+  fi
+
+  # Ensure the kernel module loads on boot.
+  as_root bash -c 'echo wireguard > /etc/modules-load.d/wireguard.conf'
+
+  # Enable on boot and (re)start the tunnel.
+  log "Enabling and starting wg-quick@${WG_IFACE} ..."
+  as_root systemctl enable "wg-quick@${WG_IFACE}" >/dev/null 2>&1 || true
+  if as_root systemctl restart "wg-quick@${WG_IFACE}"; then
+    sleep 2
+    ok "WireGuard interface ${WG_IFACE} is up."
+    as_root wg show "$WG_IFACE" 2>/dev/null || true
+  else
+    warn "Failed to start wg-quick@${WG_IFACE}; check ${conf_dest} and 'systemctl status wg-quick@${WG_IFACE}'."
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 run_stages() {
@@ -240,6 +331,7 @@ run_stages() {
   ensure_dependencies
   install_opencode
   setup_ssh_key
+  setup_wireguard
 }
 
 main() {
@@ -252,7 +344,7 @@ main() {
     resolve_sudo
   fi
 
-  if ! confirm "This will update system packages (sudo) and install opencode (per-user). Proceed?"; then
+  if ! confirm "This will update packages, install opencode, set up the SSH key, and configure WireGuard. Proceed?"; then
     die "Aborted by user."
   fi
 
